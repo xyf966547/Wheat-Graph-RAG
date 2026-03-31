@@ -1,0 +1,4 @@
+python build_kg.py
+streamlit run app.py
+
+C:\Users\Administrator\Desktop\Wheat_KG_Project>

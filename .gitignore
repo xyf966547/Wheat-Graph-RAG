@@ -1,0 +1,11 @@
+# 忽略环境变量文件（最重要！防止密码泄露）
+.env
+
+# 忽略 Python 的虚拟环境和缓存文件夹
+venv/
+env/
+__pycache__/
+*.pyc
+
+# 忽略本地生成的图谱缓存文件
+kg_graph.html
