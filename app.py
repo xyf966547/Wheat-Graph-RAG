@@ -12,8 +12,8 @@ from graph_rag import WheatGraphRAG
 load_dotenv()
 
 # --- 1. 初始化配置 ---
-URI = "neo4j+s://710ff41d.databases.neo4j.io"
-AUTH = ("710ff41d", "eV0fZRsHgaByzGS5jjmRxn9nRBUwqwNTLhpbeGl7TIY") 
+URI = "bolt://localhost:7687"
+AUTH = ("neo4j", "xuyf10224219")
 
 # 定义支持的大模型配置字典
 MODEL_CONFIGS = {
@@ -26,6 +26,16 @@ MODEL_CONFIGS = {
         "api_key": "sk-d6a929086835478c96bea0cbc6e4a3ae", 
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "model_name": "qwen-plus"
+    },
+    "Kimi (月之暗面)": {
+        "api_key": "sk-bH4c2rhTy1qmW5Qr9HuhLanSskLUZfRjpeD4YmlBgvDqMppB", 
+        "base_url": "https://api.moonshot.cn/v1",
+        "model_name": "moonshot-v1-8k"
+    },
+    "智谱 GLM-4": {
+        "api_key": "db3d6c35dd744a84a548b20c82b2766c.52EiUTIAvoH1sAZi", 
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model_name": "glm-4"
     }
 }
 
@@ -49,7 +59,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("🌾 知识图谱增强：小麦表型预测 (Graph-RAG)")
+st.title(" 知识图谱增强：小麦表型预测 (Graph-RAG)")
 
 # --- 3. 初始化会话状态 ---
 if "messages" not in st.session_state:
@@ -59,7 +69,7 @@ if "current_context" not in st.session_state:
 
 # --- 4. 侧边栏控制区 ---
 with st.sidebar:
-    st.header("🤖 AI 引擎设置")
+    st.header(" AI 引擎设置")
     selected_models = st.multiselect(
         "选择进行对比的大模型 (可多选):", 
         list(MODEL_CONFIGS.keys()),
@@ -67,12 +77,12 @@ with st.sidebar:
     )
     st.markdown("---")
 
-    st.header("🔍 图谱查询")
-    search_variety = st.text_input("输入查询品种 (如 GID1 或 ADT_1):", "GID1")
+    st.header(" 图谱查询")
+    search_variety = st.text_input("输入查询品种 (如 GID1 或 ADT_52):", "GID1")
     search_btn = st.button("生成图谱并载入 AI 上下文")
     
     st.markdown("---")
-    st.header("🛠️ 知识库扩展 (模拟新数据)")
+    st.header(" 知识库扩展 (模拟新数据)")
     st.info("在此输入新表型，它将自动挂载到上方查询的品种节点上。")
     
     new_p_name = st.text_input("新表型名称 (如: 叶绿素含量):")
@@ -92,12 +102,12 @@ with st.sidebar:
                     SET r.value = $val
                     """
                     session.run(query, vid=search_variety, pname=new_p_name, val=float(new_p_val))
-                    st.success(f"✅ 成功！表型 '{new_p_name}' 已挂载。请重新点击最上方的【生成图谱】按钮查看变化。")
+                    st.success(f" 成功！表型 '{new_p_name}' 已挂载。请重新点击最上方的【生成图谱】按钮查看变化。")
         else:
             st.error("请完整填写表型名称和数值！")
             
     st.markdown("---")
-    if st.button("🗑️ 清空聊天记录"):
+    if st.button(" 清空聊天记录"):
         st.session_state.messages = [{"role": "assistant", "content": "聊天记录已清空。"}]
         st.rerun()
 
@@ -106,32 +116,62 @@ col_graph, col_chat = st.columns([7, 3], gap="large")
 
 # ==================== 左侧：图谱可视化区 ====================
 with col_graph:
-    st.subheader("🕸️ 知识图谱视图")
+    st.subheader(" 知识图谱视图")
     
     if search_btn:
         with st.spinner('正在渲染图谱并提取知识...'):
             st.session_state.current_context = rag_tool.extract_features_for_llm(search_variety)
             
             with driver.session() as session:
-                # 【修改核心】：精准抽取！拿所有的表型，外加 30 个 SNP 代表
+                # 1. 查：品种 -> 表型
                 query_pheno = """
                 MATCH (v:Variety {id: $vid})-[r:HAS_PHENOTYPE]->(p:Phenotype)
                 RETURN v AS n1, type(r) AS rel_type, r AS rel_props, p AS n2 
                 """
                 records_pheno = list(session.run(query_pheno, vid=search_variety))
 
+                # 2. 查：品种 -> 基因型 (抽取100个代表)
                 query_snp = """
                 MATCH (v:Variety {id: $vid})-[r:HAS_ALLELE]->(s:SNP)
                 RETURN v AS n1, type(r) AS rel_type, r AS rel_props, s AS n2 
-                LIMIT 30
+                LIMIT 100
                 """
                 records_snp = list(session.run(query_snp, vid=search_variety))
                 
-                # 将两部分数据合并画图
-                records = records_pheno + records_snp
+                # 3. 【全新升级】：基因型 -> 表型调控关系 (随机洗牌，雨露均沾版)
+                query_sp = """
+                MATCH (v:Variety {id: $vid})-[r_allele:HAS_ALLELE]->(s:SNP)
+                MATCH (v)-[:HAS_PHENOTYPE]->(p:Phenotype)
+                MATCH (s)-[r_inf:INFLUENCES]->(p)
+                WITH v, s, r_allele, r_inf, p
+                ORDER BY rand()  // 核心魔法：彻底打乱顺序，让所有表型公平竞争
+                LIMIT 200        // 抽取200条精美的调控通路，避免浏览器卡死
+                RETURN v, s, r_allele, r_inf, p
+                """
+                sp_results = session.run(query_sp, vid=search_variety)
+                
+                records_sp = []
+                for res in sp_results:
+                    # 1. 画出漂亮的紫线 (调控关系: SNP -> 表型)
+                    records_sp.append({
+                        "n1": res["s"], 
+                        "rel_type": "INFLUENCES", 
+                        "rel_props": res["r_inf"], 
+                        "n2": res["p"]
+                    })
+                    # 2. 强行补上品种到这些 SNP 的连线，防止被抽中的基因节点孤立悬空
+                    records_sp.append({
+                        "n1": res["v"], 
+                        "rel_type": "HAS_ALLELE", 
+                        "rel_props": res["r_allele"], 
+                        "n2": res["s"]
+                    })
+                
+                # 将三部分数据合并画图
+                records = records_pheno + records_snp + records_sp
 
             if not records:
-                st.warning(f"未找到品种 {search_variety} 的关联数据！如果确实没数据，请尝试查询 GID10 或 GID100 等其他品种。")
+                st.warning(f"未找到品种 {search_variety} 的关联数据！如果确实没数据，请尝试查询其他品种。")
             else:
                 net = Network(height="1000px", width="100%", bgcolor="#ffffff", font_color="black", cdn_resources='remote')
                 net.force_atlas_2based(gravity=-60, spring_length=150)
@@ -141,9 +181,15 @@ with col_graph:
                     n_id = str(node_dict.get("id") or node_dict.get("name"))
                     if n_id not in nodes_added:
                         labels = list(node_dict.labels)
+                        # 已知的核心节点
                         if "Variety" in labels: net.add_node(n_id, label=n_id, color="#2ECC71", size=30, font={"size": 16, "bold": True})
                         elif "Phenotype" in labels: net.add_node(n_id, label=n_id, color="#FF7675", size=20, shape="hexagon")
                         elif "SNP" in labels: net.add_node(n_id, label=n_id, color="#F39C12", size=15)
+                        
+                        # 🛡️【前端自适应兜底】：如果遇到未来新增的、代码不认识的节点，统一画成灰色圆点，绝不报错！
+                        else: 
+                            net.add_node(n_id, label=n_id, color="#95A5A6", size=15, shape="dot")
+                            
                         nodes_added.add(n_id)
                     return n_id
 
@@ -153,9 +199,16 @@ with col_graph:
                     if not id1 or not id2: continue
                     
                     rel_type = record["rel_type"]
-                    color, dash, label = "#BDC3C7", False, ""
-                    if rel_type == "HAS_PHENOTYPE": color, label = "#A9DFBF", str(record["rel_props"].get("value", ""))
-                    elif rel_type == "HAS_ALLELE": color, label = "#FAD7A1", str(record["rel_props"].get("allele", ""))
+                    # 【连线自适应兜底】：默认全部用灰色实线画出来
+                    color, dash, label = "#BDC3C7", False, str(rel_type)
+                    
+                    # 如果是认识的，再覆盖成特定颜色
+                    if rel_type == "HAS_PHENOTYPE": 
+                        color, label = "#A9DFBF", str(record["rel_props"].get("value", ""))
+                    elif rel_type == "HAS_ALLELE": 
+                        color, label = "#FAD7A1", str(record["rel_props"].get("allele", ""))
+                    elif rel_type == "INFLUENCES": 
+                        color, dash, label = "#9B59B6", True, "调控"
                     
                     try: net.add_edge(id1, id2, title=rel_type, label=label, arrows="to", color=color, dashes=dash)
                     except: pass
@@ -164,7 +217,7 @@ with col_graph:
                     net.save_graph("kg_graph.html")
                     with open("kg_graph.html", 'r', encoding='utf-8') as f:
                         st.session_state["saved_graph_html"] = f.read()
-                    st.success(f"图谱渲染完毕。已显示 {search_variety} 的表型及部分关键基因型数据。")
+                    st.success(f"图谱渲染完毕。已显示 {search_variety} 的表型、部分关键基因型数据，及其调控关系。")
                 except Exception as e:
                     st.error(f"渲染错误: {e}")
 
@@ -174,7 +227,7 @@ with col_graph:
 
 # ==================== 右侧：AI 对话聊天区 ====================
 with col_chat:
-    st.subheader("💬 图谱 AI 助手 (多模型对比)")
+    st.subheader(" 图谱 AI 助手 (多模型对比)")
     chat_container = st.container(height=1200)
     
     with chat_container:
@@ -191,7 +244,7 @@ with col_chat:
 
     if prompt := st.chat_input("向我提问，例如：预测它的抗旱指数并给出理由"):
         if not selected_models:
-            st.warning("⚠️ 请至少在左侧选择一个大模型！")
+            st.warning(" 请至少在左侧选择一个大模型！")
             st.stop()
             
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -200,7 +253,7 @@ with col_chat:
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
-                st.markdown("🧠 **多模型正在并行思考与对比中...**")
+                st.markdown(" **多模型正在并行思考与对比中...**")
                 
                 system_prompt = f"""
                 你是一个资深的农业计算生物学大模型。你的任务是解答用户的提问。
@@ -212,7 +265,7 @@ with col_chat:
                 
                 api_messages = [{"role": "system", "content": system_prompt}]
                 
-                for msg in st.session_state.messages[-6:-1]:
+                for msg in st.session_state.messages[-6:]:
                     if isinstance(msg["content"], dict):
                         combined_memory = "\n\n".join([f"[{k}] 的回答: {v}" for k, v in msg["content"].items()])
                         api_messages.append({"role": "assistant", "content": combined_memory})
@@ -225,9 +278,9 @@ with col_chat:
                 for idx, model_name in enumerate(selected_models):
                     config = MODEL_CONFIGS[model_name]
                     with cols[idx]:
-                        st.markdown(f"### 💡 {model_name}")
+                        st.markdown(f"###  {model_name}")
                         response_placeholder = st.empty()
-                        response_placeholder.markdown("⏳ 思考中...")
+                        response_placeholder.markdown(" 思考中...")
                         
                         try:
                             dynamic_client = OpenAI(
@@ -246,7 +299,7 @@ with col_chat:
                             model_responses[model_name] = reply_text
                             
                         except Exception as e:
-                            error_msg = f"❌ 调用失败\n报错信息: {e}"
+                            error_msg = f" 调用失败\n报错信息: {e}"
                             response_placeholder.error(error_msg)
                             model_responses[model_name] = error_msg
                 
