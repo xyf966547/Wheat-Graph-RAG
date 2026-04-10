@@ -1,10 +1,17 @@
+
 import streamlit as st
 import streamlit.components.v1 as components
 from neo4j import GraphDatabase
 from pyvis.network import Network
 import os
+import random
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from langchain_community.graphs import Neo4jGraph
+from langchain.chains import GraphCypherQAChain
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
 
 # 导入之前写的图谱特征提取器
 from graph_rag import WheatGraphRAG
@@ -45,6 +52,34 @@ def get_driver():
 
 driver = get_driver()
 rag_tool = WheatGraphRAG(URI, AUTH)
+#  【新增段落 2】初始化 LangChain 图谱挖掘引擎
+@st.cache_resource
+def init_langchain_engine():
+    # 1. 连接图谱 (LangChain 专属)
+    kg = Neo4jGraph(url=URI, username=AUTH[0], password=AUTH[1])
+    # 2. 挂载大模型 (复用 DeepSeek 的密钥，把温度设为0以保证 Cypher 代码严谨)
+    llm = ChatOpenAI(
+        model="deepseek-chat",
+        api_key=MODEL_CONFIGS["DeepSeek"]["api_key"],
+        base_url=MODEL_CONFIGS["DeepSeek"]["base_url"],
+        temperature=0.0 
+    )
+    # 3. 护栏规则
+    CYPHER_TEMPLATE = """
+    你是一个精通 Neo4j 的农业计算生物学专家。请根据用户的提问和图谱 Schema，编写准确的 Cypher 语句。
+    【Schema】: {schema}
+    【规则】:
+    1. 查找品种(Variety)时，优先对 `id` 属性进行不区分大小写的模糊匹配，如: `(?i).*名字.*`。
+    2. 表型(Phenotype)的连线(SHOWS_TRAIT)属性包含大写 Value 或小写 value，需用 coalesce(r.Value, r.value) 取值。
+    3. 只输出 Cypher 语句，不要有任何多余的解释文字。
+    用户提问: {question}
+    """
+    prompt = PromptTemplate(input_variables=["schema", "question"], template=CYPHER_TEMPLATE)
+    # 4. 生成挖掘链
+    return GraphCypherQAChain.from_llm(llm=llm, graph=kg, verbose=True, cypher_prompt=prompt)
+
+# 获取全局挖掘引擎
+cypher_chain = init_langchain_engine()
 
 # --- 2. 页面与样式配置 ---
 st.set_page_config(layout="wide", page_title="小麦图谱查询系统")
@@ -78,15 +113,33 @@ with st.sidebar:
     st.markdown("---")
 
     st.header(" 图谱查询")
-    search_variety = st.text_input("输入查询品种 (如 GID1 或 ADT_52):", "GID1")
+    
+    # 1. 初始化 session 状态（用于保存输入框里的品种名）
+    if "search_vid" not in st.session_state:
+        st.session_state.search_vid = "K147"  # 给个默认的高产天选品种
+
+    # 2. 摇骰子按钮逻辑
+    if st.button(" 试试手气 (随机抽取)"):
+        with st.spinner("正在图谱中摇骰子..."):
+            with driver.session() as session:
+                # 用 Cypher 的 rand() 在数据库底层抽取一个品种
+                rand_query = "MATCH (v:Variety) RETURN coalesce(v.id, v.name) AS v_id ORDER BY rand() LIMIT 1"
+                res = session.run(rand_query).single()
+                if res:
+                    st.session_state.search_vid = res["v_id"]  # 把抽到的名字存入状态
+                    st.success(f" 抽中盲盒品种：{st.session_state.search_vid}！请点击下方生成图谱。")
+
+    # 3. 将输入框的 value 绑定到我们的 session 状态上
+    search_variety = st.text_input("输入查询品种 (如 M004 或 s44):", value=st.session_state.search_vid)
     search_btn = st.button("生成图谱并载入 AI 上下文")
     
     st.markdown("---")
     st.header(" 知识库扩展 (模拟新数据)")
     st.info("在此输入新表型，它将自动挂载到上方查询的品种节点上。")
     
-    new_p_name = st.text_input("新表型名称 (如: 叶绿素含量):")
+    new_p_name = st.text_input("新表型名称 (如: Yield):")
     new_p_val = st.text_input("测定数值 (如: 55.2):")
+    new_p_env = st.text_input("所属环境 (如: E1):", "E1")
     
     if st.button("将新数据录入并自动挂载"):
         if new_p_name and new_p_val:
@@ -98,11 +151,11 @@ with st.sidebar:
                     query = """
                     MATCH (v:Variety {id: $vid})
                     MERGE (p:Phenotype {name: $pname})
-                    MERGE (v)-[r:HAS_PHENOTYPE]->(p)
-                    SET r.value = $val
+                    MERGE (v)-[r:SHOWS_TRAIT]->(p)
+                    SET r.Value = $val, r.Environment = $env
                     """
-                    session.run(query, vid=search_variety, pname=new_p_name, val=float(new_p_val))
-                    st.success(f" 成功！表型 '{new_p_name}' 已挂载。请重新点击最上方的【生成图谱】按钮查看变化。")
+                    session.run(query, vid=search_variety, pname=new_p_name, val=float(new_p_val), env=new_p_env)
+                    st.success(f" 成功！表型 '{new_p_name}' 已挂载到 {new_p_env} 环境。请重新点击上方的【生成图谱】查看。")
         else:
             st.error("请完整填写表型名称和数值！")
             
@@ -125,7 +178,7 @@ with col_graph:
             with driver.session() as session:
                 # 1. 查：品种 -> 表型
                 query_pheno = """
-                MATCH (v:Variety {id: $vid})-[r:HAS_PHENOTYPE]->(p:Phenotype)
+                MATCH (v:Variety {id: $vid})-[r:SHOWS_TRAIT|HAS_PHENOTYPE]->(p:Phenotype)
                 RETURN v AS n1, type(r) AS rel_type, r AS rel_props, p AS n2 
                 """
                 records_pheno = list(session.run(query_pheno, vid=search_variety))
@@ -138,28 +191,25 @@ with col_graph:
                 """
                 records_snp = list(session.run(query_snp, vid=search_variety))
                 
-                # 3. 【全新升级】：基因型 -> 表型调控关系 (随机洗牌，雨露均沾版)
+                # 3. 查：基因型 -> 表型调控关系 (复杂关联网络)
                 query_sp = """
                 MATCH (v:Variety {id: $vid})-[r_allele:HAS_ALLELE]->(s:SNP)
-                MATCH (v)-[:HAS_PHENOTYPE]->(p:Phenotype)
-                MATCH (s)-[r_inf:INFLUENCES]->(p)
+                MATCH (s)-[r_inf:INFLUENCES]->(p:Phenotype)
                 WITH v, s, r_allele, r_inf, p
-                ORDER BY rand()  // 核心魔法：彻底打乱顺序，让所有表型公平竞争
-                LIMIT 200        // 抽取200条精美的调控通路，避免浏览器卡死
+                ORDER BY r_inf.P_value ASC // 优先展示 P 值最小的、最显著的调控线
+                LIMIT 150        
                 RETURN v, s, r_allele, r_inf, p
                 """
                 sp_results = session.run(query_sp, vid=search_variety)
                 
                 records_sp = []
                 for res in sp_results:
-                    # 1. 画出漂亮的紫线 (调控关系: SNP -> 表型)
                     records_sp.append({
                         "n1": res["s"], 
                         "rel_type": "INFLUENCES", 
                         "rel_props": res["r_inf"], 
                         "n2": res["p"]
                     })
-                    # 2. 强行补上品种到这些 SNP 的连线，防止被抽中的基因节点孤立悬空
                     records_sp.append({
                         "n1": res["v"], 
                         "rel_type": "HAS_ALLELE", 
@@ -167,7 +217,6 @@ with col_graph:
                         "n2": res["s"]
                     })
                 
-                # 将三部分数据合并画图
                 records = records_pheno + records_snp + records_sp
 
             if not records:
@@ -181,12 +230,9 @@ with col_graph:
                     n_id = str(node_dict.get("id") or node_dict.get("name"))
                     if n_id not in nodes_added:
                         labels = list(node_dict.labels)
-                        # 已知的核心节点
                         if "Variety" in labels: net.add_node(n_id, label=n_id, color="#2ECC71", size=30, font={"size": 16, "bold": True})
                         elif "Phenotype" in labels: net.add_node(n_id, label=n_id, color="#FF7675", size=20, shape="hexagon")
                         elif "SNP" in labels: net.add_node(n_id, label=n_id, color="#F39C12", size=15)
-                        
-                        # 🛡️【前端自适应兜底】：如果遇到未来新增的、代码不认识的节点，统一画成灰色圆点，绝不报错！
                         else: 
                             net.add_node(n_id, label=n_id, color="#95A5A6", size=15, shape="dot")
                             
@@ -199,14 +245,20 @@ with col_graph:
                     if not id1 or not id2: continue
                     
                     rel_type = record["rel_type"]
-                    # 【连线自适应兜底】：默认全部用灰色实线画出来
                     color, dash, label = "#BDC3C7", False, str(rel_type)
                     
-                    # 如果是认识的，再覆盖成特定颜色
-                    if rel_type == "HAS_PHENOTYPE": 
-                        color, label = "#A9DFBF", str(record["rel_props"].get("value", ""))
+                    if rel_type in ["SHOWS_TRAIT", "HAS_PHENOTYPE"]: 
+                        # 尝试获取新数据的 Value 或老数据的 value
+                        val = record["rel_props"].get("Value", record["rel_props"].get("value", ""))
+                        env = record["rel_props"].get("Environment", "")
+                        label_text = f"{val} ({env})" if env else str(val)
+                        color, label = "#A9DFBF", label_text
+                        
                     elif rel_type == "HAS_ALLELE": 
-                        color, label = "#FAD7A1", str(record["rel_props"].get("allele", ""))
+                        # 兼容新数据的 Genotype 或老数据的 allele
+                        allele_val = record["rel_props"].get("Genotype", record["rel_props"].get("allele", ""))
+                        color, label = "#FAD7A1", str(allele_val)
+                        
                     elif rel_type == "INFLUENCES": 
                         color, dash, label = "#9B59B6", True, "调控"
                     
@@ -217,7 +269,7 @@ with col_graph:
                     net.save_graph("kg_graph.html")
                     with open("kg_graph.html", 'r', encoding='utf-8') as f:
                         st.session_state["saved_graph_html"] = f.read()
-                    st.success(f"图谱渲染完毕。已显示 {search_variety} 的表型、部分关键基因型数据，及其调控关系。")
+                    st.success(f"图谱渲染完毕。已显示 {search_variety} 的多环境表型及其遗传调控网络。")
                 except Exception as e:
                     st.error(f"渲染错误: {e}")
 
@@ -242,7 +294,7 @@ with col_chat:
                 else:
                     st.markdown(message["content"])
 
-    if prompt := st.chat_input("向我提问，例如：预测它的抗旱指数并给出理由"):
+    if prompt := st.chat_input("向我提问，例如：分析其在E1环境下的产量潜力"):
         if not selected_models:
             st.warning(" 请至少在左侧选择一个大模型！")
             st.stop()
@@ -260,7 +312,7 @@ with col_chat:
                 【当前激活图谱的底层硬核数据如下，这是回答用户问题的绝对依据】：
                 {st.session_state.current_context}
                 
-                请结合上述知识图谱中提取的精确数值和基因型，进行专业、严谨的分析回答。
+                请结合上述知识图谱中提取的精确数值和基因型，进行专业、严谨的分析回答。如果涉及多个环境(如E1, E2)，请注重对比分析。
                 """
                 
                 api_messages = [{"role": "system", "content": system_prompt}]
