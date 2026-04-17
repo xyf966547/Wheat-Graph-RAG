@@ -28,7 +28,7 @@ class WheatKGBuilder:
             except Exception as e:
                 # 如果捕获到索引冲突的报错
                 if "IndexAlreadyExists" in str(e):
-                    print("⚠️ 检测到旧的 SNP 索引冲突，正在自动修复...")
+                    print(" 检测到旧的 SNP 索引冲突，正在自动修复...")
                     # 查找冲突的索引名称
                     result = session.run("SHOW INDEXES YIELD name, labelsOrTypes, properties WHERE labelsOrTypes = ['SNP'] AND properties = ['id'] RETURN name")
                     for record in result:
@@ -39,7 +39,7 @@ class WheatKGBuilder:
                     
                     # 重新创建唯一性约束
                     session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:SNP) REQUIRE s.id IS UNIQUE")
-                    print("✅ SNP 唯一性约束重建成功！")
+                    print(" SNP 唯一性约束重建成功！")
                 else:
                     # 如果是其他报错，则抛出
                     raise e
@@ -56,7 +56,7 @@ class WheatKGBuilder:
             for index, row in df.iterrows():
                 variety_id = str(row[id_col]).strip()
                 
-                # 【修改点】分离 MERGE 和 SET，只依赖唯一 ID 进行查找或创建
+                # 分离 MERGE 和 SET，只依赖唯一 ID 进行查找或创建
                 session.run("""
                 MERGE (v:Variety {id: $id})
                 SET v.source = $source
